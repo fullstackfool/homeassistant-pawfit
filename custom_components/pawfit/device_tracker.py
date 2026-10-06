@@ -1,13 +1,20 @@
-import aiohttp
 import logging
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+import time
+from datetime import datetime, timedelta
+
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.entity import Entity
 from homeassistant.components.device_tracker import TrackerEntity, SourceType
 from homeassistant.core import callback
-from datetime import datetime, timezone, timedelta
+from homeassistant.util import dt as dt_util
 
 from .pawfit_api import PawfitApiClient
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    UPDATE_INTERVAL_SECONDS,
+    MIN_FETCH_SPACING_SECONDS,
+    ACTIVITY_INTERVAL_SECONDS,
+)
 
 # Define SOURCE_TYPE_GPS constant for device tracker
 SOURCE_TYPE_GPS = "gps"
@@ -22,152 +29,133 @@ except ImportError:
         pass
 
 class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
+    """Fetch every tracker's data on a fixed schedule, with a hard rate limit.
+
+    Fork change. Upstream polled every 60 s but switched to 1 s polling for
+    10 minutes after any Find/Light/Alarm press, fetched activity on every
+    refresh, and let any refresh request (homeassistant.update_entity, a
+    button) trigger an extra fetch. Here:
+    - location is fetched every UPDATE_INTERVAL_SECONDS, in one request for
+      all trackers (upstream made the same request twice per refresh);
+    - extra refresh requests are ignored until a minute has passed, and two
+      fetches are never closer than MIN_FETCH_SPACING_SECONDS whatever asks;
+    - daily activity is fetched at most every ACTIVITY_INTERVAL_SECONDS.
+    """
+
     def __init__(self, hass, client, trackers):
         self.logger = logging.getLogger(__name__)
         super().__init__(
             hass,
             logger=self.logger,
             name=DOMAIN,
-            update_interval=timedelta(seconds=60),  # Default: Poll every 60 seconds
+            update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
         )
         self.client = client
         self.trackers = trackers
         self.tracker_ids = [t["tracker_id"] for t in trackers]
-        self._default_interval = timedelta(seconds=60)
-        self._fast_interval = timedelta(seconds=1)
+        self._last_fetch = None  # time.monotonic() of the last location fetch
+        self._activity = {}  # str(tracker_id) -> activity stats
+        self._activity_fetched = None  # time.monotonic() of the last activity fetch
+        self._activity_day = None
+        self.fetches_today = 0
+        self._fetch_day = None
         self.logger.info(f"PawfitDataUpdateCoordinator initialized with trackers: {self.tracker_ids}")
 
-    def _check_any_mode_active(self, data):
-        """Check if any tracker has an active mode (find, light, or alarm)."""
-        if not data:
-            self.logger.debug("No data available for mode check")
-            return False
-        
-        import time
-        current_time = time.time() * 1000  # Convert to milliseconds
-        
-        for tracker_id_str, tracker_data in data.items():
-            # Check if any timer is active (> 0)
-            find_timer = tracker_data.get("find_timer", 0)
-            light_timer = tracker_data.get("light_timer", 0)
-            alarm_timer = tracker_data.get("alarm_timer", 0)
-            
-            self.logger.debug(f"Tracker {tracker_id_str}: find_timer={find_timer}, light_timer={light_timer}, alarm_timer={alarm_timer}, current_time={current_time}")
-            
-            if any(timer and timer > 0 for timer in [find_timer, light_timer, alarm_timer]):
-                # Double check if mode is still within 10 minutes
-                for timer_name, timer in [("find", find_timer), ("light", light_timer), ("alarm", alarm_timer)]:
-                    if timer and timer > 0:
-                        elapsed = current_time - timer
-                        self.logger.debug(f"Tracker {tracker_id_str} {timer_name} mode: timer={timer}, elapsed={elapsed}ms ({elapsed/1000:.1f}s)")
-                        if 0 <= elapsed <= 600000:  # 10 minutes in milliseconds
-                            self.logger.debug(f"Tracker {tracker_id_str} has active {timer_name} mode (elapsed: {elapsed/1000:.1f}s)")
-                            return True
-        
-        self.logger.debug("No active modes detected")
-        return False
+    def _seconds_since_fetch(self):
+        if self._last_fetch is None:
+            return None
+        return time.monotonic() - self._last_fetch
 
-    def _update_polling_interval(self, data):
-        """Update polling interval based on whether any modes are active."""
-        any_active = self._check_any_mode_active(data)
-        new_interval = self._fast_interval if any_active else self._default_interval
-        
-        if self.update_interval != new_interval:
-            old_interval = self.update_interval
-            self.update_interval = new_interval
-            self.logger.debug(f"Updated polling interval from {old_interval.total_seconds()}s to {new_interval.total_seconds()}s (modes active: {any_active})")
-            
-            # Force immediate rescheduling by canceling current refresh and rescheduling
-            self._async_unsub_refresh()
-            if self._listeners:  # Only schedule if we have listeners
-                self._schedule_refresh()
+    async def async_request_refresh(self) -> None:
+        """Ignore refresh requests within a minute of the last fetch.
 
-    async def async_set_fast_polling(self):
-        """Immediately switch to fast polling mode (called when a mode is started)."""
-        if self.update_interval != self._fast_interval:
-            self.logger.debug(f"Immediately switching to fast polling (1 second)")
-            self.update_interval = self._fast_interval
-            
-            # Cancel current scheduled refresh and start fast polling immediately
-            self._async_unsub_refresh()
-            if self._listeners:  # Only schedule if we have listeners
-                self._schedule_refresh()
+        Covers homeassistant.update_entity and anything else that asks for a
+        refresh outside the schedule. Dropping them here, not only in
+        _async_update_data, also stops a skipped request from pushing the
+        next scheduled fetch back.
+        """
+        since = self._seconds_since_fetch()
+        if since is not None and since < UPDATE_INTERVAL_SECONDS:
+            self.logger.debug("Refresh request ignored: last Pawfit fetch %.0f s ago", since)
+            return
+        await super().async_request_refresh()
+
+    @callback
+    def async_set_mode_timer(self, tracker_id, key, value) -> None:
+        """Record a Find/Light/Alarm change locally, without an extra fetch.
+
+        The next scheduled fetch replaces it with what Pawfit reports.
+        """
+        if not self.data:
+            return
+        tracker_data = self.data.get(str(tracker_id))
+        if tracker_data is None:
+            return
+        tracker_data[key] = value
+        self.async_update_listeners()
+
+    def _count_fetch(self) -> None:
+        today = dt_util.now().date()
+        if today != self._fetch_day:
+            self._fetch_day = today
+            self.fetches_today = 0
+        self.fetches_today += 1
 
     async def _async_update_data(self):
+        since = self._seconds_since_fetch()
+        if since is not None and since < MIN_FETCH_SPACING_SECONDS:
+            # Second guard: nothing reaches the Pawfit API inside the limit.
+            self.logger.debug("Fetch skipped: last Pawfit fetch %.0f s ago", since)
+            if self.data is not None:
+                return self.data
+            raise UpdateFailed("Waiting for the Pawfit rate limit")
+        now = time.monotonic()
+        self._last_fetch = now
+        self._count_fetch()
+
         self.logger.debug(f"_async_update_data called for trackers: {self.tracker_ids}")
-        # Fetch latest location data for all trackers
         location_data = await self.client.async_get_locations(self.tracker_ids)
-        
-        # Convert location_data keys to strings for consistency with detailed_status keys
-        if location_data:
-            location_data_str_keys = {str(k): v for k, v in location_data.items()}
-            location_data = location_data_str_keys
-        
-        # Fetch detailed status data including timers
-        try:
-            detailed_status = await self.client.async_get_detailed_status(self.tracker_ids)
-            
-            # If detailed_status is a list, convert to dict by tracker ID
-            if isinstance(detailed_status, list):
-                detailed_dict = {}
-                for item in detailed_status:
-                    tracker_id = item.get("tracker") or item.get("tracker_id") or item.get("id")
-                    if tracker_id:
-                        detailed_dict[str(tracker_id)] = item
-                    else:
-                        self.logger.warning(f"Could not extract tracker_id from detailed status item: {item}")
-                detailed_status = detailed_dict
-            elif isinstance(detailed_status, dict):
-                pass  # Already in correct format
-            else:
-                self.logger.error(f"Unexpected detailed_status type: {type(detailed_status)}, content: {detailed_status}")
-                detailed_status = {}
-            
-            # Merge the data by tracker ID
-            for tracker_id_str, tracker_info in detailed_status.items():
-                if tracker_id_str in location_data:
-                    # Add timer and status information from detailed status
-                    timer_gps = tracker_info.get("timerGps", 0)
-                    timer_light = tracker_info.get("timerLight", 0)
-                    timer_speaker = tracker_info.get("timerSpeaker", 0)
-                    
-                    location_data[tracker_id_str].update({
-                        "find_timer": timer_gps,
-                        "light_timer": timer_light, 
-                        "alarm_timer": timer_speaker
-                    })
-                else:
-                    self.logger.warning(f"Tracker {tracker_id_str} from detailed status not found in location_data. Available location data keys: {list(location_data.keys())}")
-        except Exception as e:
-            self.logger.error(f"Failed to fetch detailed status: {e}", exc_info=True)
-            # Continue with just location data if detailed status fails
-            
-        # Update polling interval based on active modes
-        self._update_polling_interval(location_data)
-        
-        # Fetch activity stats for each tracker
-        self.logger.debug(f"Fetching activity stats for {len(self.tracker_ids)} trackers: {self.tracker_ids}")
-        try:
-            for tracker_id in self.tracker_ids:
-                self.logger.debug(f"Requesting activity stats for tracker {tracker_id}")
-                activity_stats = await self.client.async_get_activity_stats(str(tracker_id))
-                self.logger.debug(f"Received activity stats for tracker {tracker_id}: {activity_stats}")
-                
-                if str(tracker_id) in location_data:
-                    before_update = location_data[str(tracker_id)].copy()
-                    location_data[str(tracker_id)].update({
-                        "steps_today": activity_stats.get("total_steps", 0),
-                        "calories_today": activity_stats.get("total_calories", 0.0),
-                        "active_time_today": activity_stats.get("total_active_hours", 0.0)
-                    })
-                    self.logger.debug(f"Updated tracker {tracker_id} data. Before: {before_update}, After: {location_data[str(tracker_id)]}")
-                else:
-                    self.logger.warning(f"Tracker {tracker_id} not found in location_data for activity stats update. Available keys: {list(location_data.keys())}")
-        except Exception as e:
-            self.logger.error(f"Failed to fetch activity stats: {e}", exc_info=True)
-            # Continue without activity stats if this fails
-            
+        location_data = {str(k): v for k, v in (location_data or {}).items()}
+
+        # The Find/Light/Alarm timers are in the same response; upstream
+        # fetched it a second time to read them.
+        for tracker_data in location_data.values():
+            raw = tracker_data.get("_raw") or {}
+            tracker_data["find_timer"] = raw.get("timerGps", 0)
+            tracker_data["light_timer"] = raw.get("timerLight", 0)
+            tracker_data["alarm_timer"] = raw.get("timerSpeaker", 0)
+
+        await self._async_update_activity(now)
+        for tracker_id_str, tracker_data in location_data.items():
+            stats = self._activity.get(tracker_id_str)
+            if stats is not None:
+                tracker_data.update({
+                    "steps_today": stats.get("total_steps", 0),
+                    "calories_today": stats.get("total_calories", 0.0),
+                    "active_time_today": stats.get("total_active_hours", 0.0),
+                })
+
         return location_data
+
+    async def _async_update_activity(self, now) -> None:
+        """Fetch daily activity if it is due (every 15 min, or a new day)."""
+        # Same clock as the activity request's midnight-to-midnight window.
+        today = datetime.now().date()
+        due = (
+            self._activity_fetched is None
+            or today != self._activity_day
+            # 30 s slack so a fetch landing a moment early still counts.
+            or now - self._activity_fetched >= ACTIVITY_INTERVAL_SECONDS - 30
+        )
+        if not due:
+            return
+        self._activity_fetched = now
+        self._activity_day = today
+        for tracker_id in self.tracker_ids:
+            # Returns zeros rather than raising if Pawfit fails.
+            stats = await self.client.async_get_activity_stats(str(tracker_id))
+            self.logger.debug(f"Received activity stats for tracker {tracker_id}: {stats}")
+            self._activity[str(tracker_id)] = stats
 
 class PawfitDeviceTracker(TrackerEntity):
     def __init__(self, tracker, coordinator):
