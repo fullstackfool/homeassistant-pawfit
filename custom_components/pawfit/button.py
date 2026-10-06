@@ -286,12 +286,34 @@ class PawfitAlarmModeButton(ButtonEntity):
         self.async_write_ha_state()
 
 
+class PawfitLocateButton(ButtonEntity):
+    """Get a fresh position from every tracker now (fork change).
+
+    Turns Find mode on, then off again for each tracker once it reports.
+    binary_sensor.pawfit_locating is on while it waits.
+    """
+
+    _attr_icon = "mdi:crosshairs-gps"
+
+    def __init__(self, coordinator, entry_id):
+        self._coordinator = coordinator
+        self._attr_name = "PawFit Locate"
+        self._attr_unique_id = f"{entry_id}_locate"
+
+    @property
+    def available(self):
+        return self._coordinator.last_update_success
+
+    async def async_press(self) -> None:
+        await self._coordinator.async_locate()
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Pawfit button entities from a config entry."""
     # Get the coordinator from hass.data (created in __init__.py)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     
-    entities = []
+    entities = [PawfitLocateButton(coordinator, entry.entry_id)]
     for tracker in coordinator.trackers:
         entities.append(PawfitFindModeButton(tracker, coordinator))
         entities.append(PawfitLightModeButton(tracker, coordinator))

@@ -129,6 +129,8 @@ This fork limits how often it talks to Pawfit:
 - **Daily activity** (steps, calories, active time): one request per tracker every 15 minutes, and again just after midnight.
 - **Find / Light / Alarm buttons**: one request per press. The mode shows as on or off at once from a local timer; there is no 1-second polling.
 - **Pawfit not answering**: if a fetch times out or fails, the last known positions and readings stay up (the cats don't vanish from maps) for up to 15 minutes after the last good fetch; after that the entities go unavailable. Upstream made them unavailable on the first failed fetch.
+- **Locate** (`button.pawfit_locate`): gets a fresh position from every tracker. Pawfit has no one-off "locate" call, so it turns Find mode on and, as each tracker reports a position newer than the press, turns Find mode off again for it (to save battery). Trackers already in Find mode are left alone. Gives up after 3 minutes. `binary_sensor.pawfit_locating` is on while it waits (icon `mdi:loading`), with `waiting_for` and `last_result` attributes. Positions are still fetched once a minute, so a press costs only the Find on/off requests.
+- **Stale positions**: each device tracker has `last_seen` (when the tracker last reported its position), `position_age_minutes` and `stale` (over 15 minutes old) attributes, and its icon changes to `mdi:map-marker-question` while stale.
 - **Counter**: `sensor.pawfit_api_requests_today` counts every request made to Pawfit (fetches, logins and commands) since midnight or Home Assistant's start. Its `location_fetches_today` attribute counts the location fetches.
 
 With two trackers that's about 1,600 requests a day. Upstream made about 5,800 a day, plus about 2,400 for each Find, Light or Alarm press.

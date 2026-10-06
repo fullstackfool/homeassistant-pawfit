@@ -49,6 +49,11 @@ class FakePawfit:
         self.calls = []
         self.fail_next_location_with_403 = False
         self.location_hangs = False  # True: location requests time out
+        # Each tracker's last position fix (seconds since epoch): old to start with.
+        self.fix_times = {tid: 1790000000 for tid in TRACKERS}
+        # In Find mode a tracker reports straight away, unless this is False (offline).
+        self.reports_when_finding = True
+        self.finding = {tid: False for tid in TRACKERS}
         self.timers = {tid: {} for tid in TRACKERS}
         for endpoint, method in ENDPOINTS:
             getattr(aioclient_mock, method)(
@@ -80,7 +85,7 @@ class FakePawfit:
             return ok({"success": True, "data": {
                 tid: {
                     "state": {
-                        "location": {"latitude": 52.63, "longitude": 1.29, "accuracy": 12, "utcDateTime": 1790000000},
+                        "location": {"latitude": 52.63, "longitude": 1.29, "accuracy": 12, "utcDateTime": self._fix(tid)},
                         "power": 80,
                         "signal": -70,
                     },
@@ -95,11 +100,18 @@ class FakePawfit:
             return AiohttpClientMockResponse(method, url, text=packed)
         if endpoint in ("starttracking", "stoptracking"):
             tid = url.query["tracker"]
+            if url.query.get("gps") == "1":
+                self.finding[tid] = endpoint == "starttracking"
             for param, field in MODE_FIELDS.items():
                 if url.query.get(param) == "1":
                     self.timers[tid][field] = int(time.time() * 1000) if endpoint == "starttracking" else 0
             return ok({"success": True})
         raise AssertionError(endpoint)
+
+    def _fix(self, tid):
+        if self.finding[tid] and self.reports_when_finding:
+            self.fix_times[tid] = int(time.time())
+        return self.fix_times[tid]
 
     def count(self, endpoint):
         return sum(1 for c in self.calls if c[0] == endpoint)

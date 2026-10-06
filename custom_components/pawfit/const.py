@@ -19,3 +19,11 @@ ACTIVITY_INTERVAL_SECONDS = 15 * 60
 KEEP_LAST_DATA_SECONDS = 15 * 60
 # Give up on a single Pawfit request after this long.
 REQUEST_TIMEOUT_SECONDS = 30
+# Locate: Find mode is turned on, then off again for each tracker as soon as
+# it reports a position newer than the press; give up after this long.
+LOCATE_TIMEOUT_SECONDS = 3 * 60
+# A position up to this much older than the press still counts (clock skew).
+LOCATE_CLOCK_SLACK_SECONDS = 10
+# A tracker's position counts as stale (attribute on the device tracker) when
+# it last reported more than this long ago.
+STALE_AFTER_SECONDS = 15 * 60

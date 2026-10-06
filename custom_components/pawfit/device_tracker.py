@@ -15,6 +15,9 @@ from .const import (
     MIN_FETCH_SPACING_SECONDS,
     ACTIVITY_INTERVAL_SECONDS,
     KEEP_LAST_DATA_SECONDS,
+    LOCATE_TIMEOUT_SECONDS,
+    LOCATE_CLOCK_SLACK_SECONDS,
+    STALE_AFTER_SECONDS,
 )
 
 # Define SOURCE_TYPE_GPS constant for device tracker
@@ -28,6 +31,27 @@ except ImportError:
         GPS = "gps"
     class TrackerEntity(Entity):
         pass
+
+def _mode_active(timer_ms) -> bool:
+    """True if a Find/Light/Alarm timer (ms since epoch) started under 10 minutes ago."""
+    try:
+        elapsed = time.time() - float(timer_ms) / 1000
+    except (TypeError, ValueError):
+        return False
+    return bool(timer_ms) and 0 <= elapsed < 600
+
+
+def fix_time(tracker_data):
+    """When the tracker last reported its position (seconds since epoch), or None."""
+    if not tracker_data:
+        return None
+    raw = tracker_data.get("_raw") or {}
+    value = (raw.get("state") or {}).get("location", {}).get("utcDateTime")
+    try:
+        return float(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
 
 class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
     """Fetch every tracker's data on a fixed schedule, with a hard rate limit.
@@ -62,6 +86,12 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
         self._fetch_day = None
         self._last_success = None  # time.monotonic() of the last good location fetch
         self._failing_since = None  # time.monotonic() when the current failure streak began
+        # Locate (fork change): time.time() the current locate began, or None.
+        self.locate_started = None
+        # str(tracker_id) -> True if Locate turned Find mode on (so it turns it off).
+        self._locate_pending = {}
+        self.locate_last_result = None
+        self.locate_last_finished = None  # datetime (UTC)
         self.logger.info(f"PawfitDataUpdateCoordinator initialized with trackers: {self.tracker_ids}")
 
     def _seconds_since_fetch(self):
@@ -96,6 +126,84 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
             return
         tracker_data[key] = value
         self.async_update_listeners()
+
+    def tracker_name(self, tracker_id) -> str:
+        for t in self.trackers:
+            if str(t["tracker_id"]) == str(tracker_id):
+                return t.get("name") or str(tracker_id)
+        return str(tracker_id)
+
+    @property
+    def locate_waiting_for(self) -> list:
+        return [self.tracker_name(tid) for tid in self._locate_pending]
+
+    async def async_locate(self) -> None:
+        """Ask every tracker for a fresh position now (fork change).
+
+        Pawfit has no one-off "locate" call, so this turns Find mode on and
+        waits: positions are still fetched once a minute, and as soon as a
+        tracker reports a position newer than the press, Find mode is turned
+        off again for it (to save its battery). Trackers that were already
+        in Find mode are left as they were. Gives up after
+        LOCATE_TIMEOUT_SECONDS.
+        """
+        if self.locate_started is not None:
+            self.logger.debug("Locate already running")
+            return
+        self.locate_started = time.time()
+        self._locate_pending = {}
+        for tracker_id in self.tracker_ids:
+            tid = str(tracker_id)
+            data = (self.data or {}).get(tid, {})
+            if _mode_active(data.get("find_timer")):
+                self._locate_pending[tid] = False
+                continue
+            try:
+                started = await self.client.async_start_find_mode(tid)
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning("Locate: couldn't start Find mode for %s: %r", self.tracker_name(tid), err)
+                started = False
+            self._locate_pending[tid] = bool(started)
+            if started and self.data and tid in self.data:
+                self.data[tid]["find_timer"] = int(time.time() * 1000)
+        self.logger.info("Locate started for %s", ", ".join(self.locate_waiting_for))
+        self.async_update_listeners()
+
+    async def _async_check_locate(self, location_data) -> None:
+        """Finish trackers that have reported since Locate began; time out the rest."""
+        if self.locate_started is None:
+            return
+        for tid in list(self._locate_pending):
+            fix = fix_time((location_data or {}).get(tid))
+            # A little slack for the tracker's clock being behind ours.
+            if fix is not None and fix >= self.locate_started - LOCATE_CLOCK_SLACK_SECONDS:
+                await self._async_end_find(tid, location_data)
+        timed_out = time.time() - self.locate_started >= LOCATE_TIMEOUT_SECONDS
+        if self._locate_pending and not timed_out:
+            return
+        if self._locate_pending:
+            missing = self.locate_waiting_for
+            for tid in list(self._locate_pending):
+                await self._async_end_find(tid, location_data)
+            self.locate_last_result = "No new position from " + ", ".join(missing)
+            self.logger.warning("Locate: %s", self.locate_last_result)
+        else:
+            self.locate_last_result = "All found"
+            self.logger.info("Locate: all trackers reported")
+        self.locate_started = None
+        self.locate_last_finished = dt_util.utcnow()
+
+    async def _async_end_find(self, tid, location_data) -> None:
+        started_by_locate = self._locate_pending.pop(tid, False)
+        if not started_by_locate:
+            return
+        try:
+            await self.client.async_stop_find_mode(tid)
+        except Exception as err:  # noqa: BLE001
+            self.logger.warning("Locate: couldn't stop Find mode for %s: %r", self.tracker_name(tid), err)
+            return
+        if location_data and tid in location_data:
+            location_data[tid]["find_timer"] = 0
 
     def _keep_last_data(self, err, now):
         """Ride out a failed fetch with the last known data (fork change).
@@ -144,9 +252,11 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
         try:
             location_data = await self.client.async_get_locations(self.tracker_ids)
         except Exception as err:  # timeouts, connection errors, bad responses
+            await self._async_check_locate(None)
             return self._keep_last_data(err, now)
         location_data = {str(k): v for k, v in (location_data or {}).items()}
         if not location_data:
+            await self._async_check_locate(None)
             return self._keep_last_data(UpdateFailed("no trackers in Pawfit's response"), now)
         if self._failing_since is not None:
             self.logger.warning(
@@ -173,6 +283,7 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
                     "active_time_today": stats.get("total_active_hours", 0.0),
                 })
 
+        await self._async_check_locate(location_data)
         return location_data
 
     async def _async_update_activity(self, now) -> None:
@@ -202,7 +313,6 @@ class PawfitDeviceTracker(TrackerEntity):
         self._tracker_id = tracker["tracker_id"]
         self._attr_name = f"{tracker['name']}'s PawFit Tracker"
         self._attr_unique_id = str(tracker["petId"])
-        self._attr_icon = "mdi:paw"
         self._attr_source_type = SourceType.GPS
         self._attr_device_info = {
             "identifiers": {(DOMAIN, str(self._tracker_id))},
@@ -228,6 +338,31 @@ class PawfitDeviceTracker(TrackerEntity):
     def available(self):
         """Return if entity is available."""
         return self._coordinator.last_update_success and self._attr_latitude is not None and self._attr_longitude is not None
+
+    def _fix_time(self):
+        data = self._coordinator.data.get(str(self._tracker_id), {}) if self._coordinator.data else {}
+        return fix_time(data)
+
+    def _is_stale(self) -> bool:
+        fix = self._fix_time()
+        return fix is None or time.time() - fix > STALE_AFTER_SECONDS
+
+    @property
+    def icon(self):
+        """Fork change: a different icon while the position is stale."""
+        return "mdi:map-marker-question" if self._is_stale() else "mdi:paw"
+
+    @property
+    def extra_state_attributes(self):
+        """Fork change: when the tracker last reported its position."""
+        fix = self._fix_time()
+        if fix is None:
+            return {"last_seen": None, "position_age_minutes": None, "stale": True}
+        return {
+            "last_seen": dt_util.utc_from_timestamp(fix).isoformat(),
+            "position_age_minutes": max(0, int((time.time() - fix) // 60)),
+            "stale": time.time() - fix > STALE_AFTER_SECONDS,
+        }
 
     def _update_attrs(self):
         data = self._coordinator.data.get(str(self._tracker_id), {}) if self._coordinator.data else {}

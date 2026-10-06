@@ -162,3 +162,77 @@ async def test_pawfit_stops_answering(hass, freezer, pawfit, setup_entry):
     # Timed-out requests still count, and still no more than one a minute.
     loc = pawfit.times("getlocationcaches")
     assert min(gaps(loc)) >= 55
+
+
+def locate_entities(hass, entry):
+    return (
+        entity_id(hass, "button", f"{entry.entry_id}_locate"),
+        entity_id(hass, "binary_sensor", f"{entry.entry_id}_locating"),
+    )
+
+
+async def press(hass, button):
+    await hass.services.async_call("button", "press", {"entity_id": button}, blocking=True)
+    await hass.async_block_till_done()
+
+
+async def test_locate(hass, freezer, pawfit, setup_entry):
+    """Locate: Find on for both, off again for each as soon as it reports."""
+    button, locating = locate_entities(hass, setup_entry)
+    tracker = entity_id(hass, "device_tracker", "11")
+    assert hass.states.get(tracker).attributes["stale"] is True  # the fake's fix is old
+    assert hass.states.get(tracker).attributes["icon"] == "mdi:map-marker-question"
+    assert hass.states.get(locating).state == "off"
+
+    start = len(pawfit.calls)
+    await press(hass, button)
+    assert pawfit.since(start) == ["starttracking", "starttracking"]
+    assert hass.states.get(locating).state == "on"
+    assert hass.states.get(locating).attributes["icon"] == "mdi:loading"
+    assert hass.states.get(locating).attributes["waiting_for"] == ["Tom", "Ginger"]
+
+    await press(hass, button)  # a second press while it's running does nothing
+    assert pawfit.since(start) == ["starttracking", "starttracking"]
+
+    await advance(hass, freezer, 61)  # the next scheduled fetch has fresh fixes
+    calls = pawfit.since(start)
+    assert calls.count("getlocationcaches") == 1
+    assert calls.count("stoptracking") == 2
+    assert not any(pawfit.finding.values())
+    state = hass.states.get(locating)
+    assert state.state == "off"
+    assert state.attributes["last_result"] == "All found"
+    attrs = hass.states.get(tracker).attributes
+    assert attrs["stale"] is False
+    assert attrs["position_age_minutes"] <= 1
+    assert attrs["icon"] == "mdi:paw"
+
+
+async def test_locate_times_out(hass, freezer, pawfit, setup_entry):
+    """No fresh fix within 3 minutes: Find goes off again and it says who's missing."""
+    button, locating = locate_entities(hass, setup_entry)
+    pawfit.reports_when_finding = False
+    start = len(pawfit.calls)
+    await press(hass, button)
+    await advance(hass, freezer, 150)
+    assert hass.states.get(locating).state == "on"
+    assert "stoptracking" not in pawfit.since(start)
+    await advance(hass, freezer, 60)
+    state = hass.states.get(locating)
+    assert state.state == "off"
+    assert state.attributes["last_result"] == "No new position from Tom, Ginger"
+    assert pawfit.since(start).count("stoptracking") == 2
+    assert min(gaps(pawfit.times("getlocationcaches"))) >= 55
+
+
+async def test_locate_leaves_find_mode_alone(hass, freezer, pawfit, setup_entry):
+    """A tracker already in Find mode isn't started or stopped by Locate."""
+    button, locating = locate_entities(hass, setup_entry)
+    await press(hass, entity_id(hass, "button", "11_find_mode_button"))  # Tom
+    start = len(pawfit.calls)
+    await press(hass, button)
+    assert pawfit.since(start) == ["starttracking"]  # Ginger only
+    await advance(hass, freezer, 61)
+    assert pawfit.since(start).count("stoptracking") == 1
+    assert pawfit.finding["1001"] is True  # Tom's Find mode still on
+    assert hass.states.get(locating).state == "off"
