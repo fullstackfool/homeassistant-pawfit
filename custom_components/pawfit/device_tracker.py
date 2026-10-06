@@ -14,6 +14,7 @@ from .const import (
     UPDATE_INTERVAL_SECONDS,
     MIN_FETCH_SPACING_SECONDS,
     ACTIVITY_INTERVAL_SECONDS,
+    KEEP_LAST_DATA_SECONDS,
 )
 
 # Define SOURCE_TYPE_GPS constant for device tracker
@@ -59,6 +60,8 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
         self._activity_day = None
         self.fetches_today = 0
         self._fetch_day = None
+        self._last_success = None  # time.monotonic() of the last good location fetch
+        self._failing_since = None  # time.monotonic() when the current failure streak began
         self.logger.info(f"PawfitDataUpdateCoordinator initialized with trackers: {self.tracker_ids}")
 
     def _seconds_since_fetch(self):
@@ -94,6 +97,30 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
         tracker_data[key] = value
         self.async_update_listeners()
 
+    def _keep_last_data(self, err, now):
+        """Ride out a failed fetch with the last known data (fork change).
+
+        Pawfit's API sometimes stops answering for a few minutes. Upstream
+        marked every entity unavailable on the first failure, so the cats
+        vanished from maps. Here the last good data is kept, and the
+        entities stay available, until KEEP_LAST_DATA_SECONDS after the last
+        good fetch. The Last Time Seen sensor still shows how old it is.
+        """
+        if self._failing_since is None:
+            self._failing_since = now
+            self.logger.warning(
+                "Pawfit fetch failed (%r); keeping the last known data for up to %d min",
+                err,
+                KEEP_LAST_DATA_SECONDS // 60,
+            )
+        if (
+            self.data is not None
+            and self._last_success is not None
+            and now - self._last_success < KEEP_LAST_DATA_SECONDS
+        ):
+            return self.data
+        raise UpdateFailed(f"No data from Pawfit: {err!r}") from err
+
     def _count_fetch(self) -> None:
         today = dt_util.now().date()
         if today != self._fetch_day:
@@ -114,8 +141,19 @@ class PawfitDataUpdateCoordinator(DataUpdateCoordinator):
         self._count_fetch()
 
         self.logger.debug(f"_async_update_data called for trackers: {self.tracker_ids}")
-        location_data = await self.client.async_get_locations(self.tracker_ids)
+        try:
+            location_data = await self.client.async_get_locations(self.tracker_ids)
+        except Exception as err:  # timeouts, connection errors, bad responses
+            return self._keep_last_data(err, now)
         location_data = {str(k): v for k, v in (location_data or {}).items()}
+        if not location_data:
+            return self._keep_last_data(UpdateFailed("no trackers in Pawfit's response"), now)
+        if self._failing_since is not None:
+            self.logger.warning(
+                "Pawfit fetch recovered after %.0f s", now - self._failing_since
+            )
+        self._failing_since = None
+        self._last_success = now
 
         # The Find/Light/Alarm timers are in the same response; upstream
         # fetched it a second time to read them.

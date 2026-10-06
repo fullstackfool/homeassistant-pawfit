@@ -131,3 +131,34 @@ async def test_midnight(hass, freezer, pawfit):
     assert first_after - midnight_utc <= 65
     loc = pawfit.times("getlocationcaches")
     assert min(gaps(loc)) >= 55
+
+
+async def test_pawfit_stops_answering(hass, freezer, pawfit, setup_entry):
+    """A few minutes of timeouts keep the last positions; 15 minutes of them don't."""
+    tracker = entity_id(hass, "device_tracker", "11")
+    before = hass.states.get(tracker).state
+    assert before != "unavailable"
+
+    pawfit.location_hangs = True
+    await advance(hass, freezer, 5 * 60)
+    assert hass.states.get(tracker).state == before  # still on the map
+
+    pawfit.location_hangs = False
+    await advance(hass, freezer, 61)
+    assert hass.states.get(tracker).state == before
+
+    # A long outage: after 15 min without a good fetch the trackers go unavailable.
+    pawfit.location_hangs = True
+    await advance(hass, freezer, 14 * 60)
+    assert hass.states.get(tracker).state == before
+    await advance(hass, freezer, 2 * 60)
+    assert hass.states.get(tracker).state == "unavailable"
+
+    # And they come back with the first good fetch.
+    pawfit.location_hangs = False
+    await advance(hass, freezer, 61)
+    assert hass.states.get(tracker).state == before
+
+    # Timed-out requests still count, and still no more than one a minute.
+    loc = pawfit.times("getlocationcaches")
+    assert min(gaps(loc)) >= 55

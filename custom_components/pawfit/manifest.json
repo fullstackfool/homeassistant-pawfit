@@ -1,7 +1,7 @@
 {
   "domain": "pawfit",
   "name": "Pawfit Pet Tracker",
-  "version": "0.4.2.1",
+  "version": "0.4.2.2",
   "codeowners": [
     "@danbaker"
   ],

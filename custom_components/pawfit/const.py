@@ -14,5 +14,8 @@ MIN_FETCH_SPACING_SECONDS = 55
 # Daily activity (steps, calories, active time) changes slowly: fetch it at
 # most every 15 minutes, and again straight after midnight.
 ACTIVITY_INTERVAL_SECONDS = 15 * 60
+# If Pawfit stops answering, keep showing the last known data (entities stay
+# available) until this long after the last good fetch.
+KEEP_LAST_DATA_SECONDS = 15 * 60
 # Give up on a single Pawfit request after this long.
 REQUEST_TIMEOUT_SECONDS = 30

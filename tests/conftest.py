@@ -48,6 +48,7 @@ class FakePawfit:
     def __init__(self, aioclient_mock):
         self.calls = []
         self.fail_next_location_with_403 = False
+        self.location_hangs = False  # True: location requests time out
         self.timers = {tid: {} for tid in TRACKERS}
         for endpoint, method in ENDPOINTS:
             getattr(aioclient_mock, method)(
@@ -71,6 +72,8 @@ class FakePawfit:
         if endpoint == "listpetinvitee":
             return ok({"success": True, "data": TRACKERS})
         if endpoint == "getlocationcaches":
+            if self.location_hangs:
+                return AiohttpClientMockResponse(method, url, exc=TimeoutError())
             if self.fail_next_location_with_403:
                 self.fail_next_location_with_403 = False
                 return AiohttpClientMockResponse(method, url, status=HTTPStatus.FORBIDDEN, text="")

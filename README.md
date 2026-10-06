@@ -128,6 +128,7 @@ This fork limits how often it talks to Pawfit:
 - **Location, battery, signal and mode timers**: one request a minute for all trackers together. Requests for an extra refresh (`homeassistant.update_entity`, a button press) are ignored until a minute has passed since the last fetch, and no two fetches are ever less than 55 seconds apart, whatever triggers them.
 - **Daily activity** (steps, calories, active time): one request per tracker every 15 minutes, and again just after midnight.
 - **Find / Light / Alarm buttons**: one request per press. The mode shows as on or off at once from a local timer; there is no 1-second polling.
+- **Pawfit not answering**: if a fetch times out or fails, the last known positions and readings stay up (the cats don't vanish from maps) for up to 15 minutes after the last good fetch; after that the entities go unavailable. Upstream made them unavailable on the first failed fetch.
 - **Counter**: `sensor.pawfit_api_requests_today` counts every request made to Pawfit (fetches, logins and commands) since midnight or Home Assistant's start. Its `location_fetches_today` attribute counts the location fetches.
 
 With two trackers that's about 1,600 requests a day. Upstream made about 5,800 a day, plus about 2,400 for each Find, Light or Alarm press.
